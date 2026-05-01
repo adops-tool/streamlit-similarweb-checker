@@ -5,3 +5,6 @@ env/
 *.pyc
 *.csv
 *.xlsx
+.DS_Store
+.idea/
+.vscode/
