@@ -1,0 +1,8 @@
+# Everything is excluded by default; the image gets only what it needs to run.
+*
+!requirements.txt
+!app.py
+!traffic_checker/
+!.streamlit/
+.streamlit/secrets.toml
+**/__pycache__/
