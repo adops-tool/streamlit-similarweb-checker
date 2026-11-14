@@ -1,8 +1,8 @@
 # DataLoom Traffic Checker
 
-A high-throughput Streamlit logging and traffic-intelligence utility for bulk SimilarWeb lookups with resilient retries, checkpoint-based recovery, and deterministic domain normalization.
+A Streamlit app for bulk SimilarWeb traffic lookups through the DataLoom API on RapidAPI. Feed it a list of websites, get monthly visits for each one, filter by a traffic threshold and export the result.
 
-[![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen?style=for-the-badge)](#testing)
+[![CI](https://img.shields.io/github/actions/workflow/status/adops-tool/streamlit-similarweb-checker/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/adops-tool/streamlit-similarweb-checker/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python)](#getting-started)
 [![Streamlit](https://img.shields.io/badge/Streamlit-App-ff4b4b?style=for-the-badge&logo=streamlit)](#usage)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
@@ -13,248 +13,217 @@ A high-throughput Streamlit logging and traffic-intelligence utility for bulk Si
 ## Table of Contents
 
 - [Features](#features)
-- [Tech Stack & Architecture](#tech-stack--architecture)
+- [How It Works](#how-it-works)
 - [Getting Started](#getting-started)
-- [Testing](#testing)
-- [Deployment](#deployment)
 - [Usage](#usage)
 - [Configuration](#configuration)
+- [Project Structure](#project-structure)
+- [Development](#development)
+- [Deployment](#deployment)
 - [License](#license)
 - [Support the Project](#support-the-project)
 
 ## Features
 
-- Async bulk SimilarWeb traffic lookups using `aiohttp` under Streamlit.
-- Concurrency controls (`asyncio.Semaphore`) for rate-limit-safe throughput.
-- Retry strategy with exponential backoff for transient API/network faults.
-- Pre-flight API key validation using a known domain before full batch execution.
-- Deterministic URL/domain normalization:
-  - strips scheme/path/query/fragment,
-  - removes `www.` and mobile-prefix variants,
-  - handles trailing dots and explicit ports.
-- Input deduplication post-normalization to reduce quota waste.
-- Session-level checkpointing in `st.session_state` for idempotent reruns.
-- Partial-progress survivability during tab crashes/reloads.
-- Configurable minimum-traffic output filtering.
-- CSV ingestion with header auto-detection for multilingual/common column names.
-- Production-friendly tunables for timeout, retries, backoff, and checkpoint cadence.
+**Input**
 
-> [!IMPORTANT]
-> Current defaults are tuned to respect typical RapidAPI/DataLoom plan constraints while preserving throughput. Increase concurrency cautiously.
+- Upload a CSV, TSV or TXT file, or paste a list straight into the page.
+- Encoding (UTF-8, UTF-16, Windows-1251) and delimiter (`,` `;` tab `|`) are detected automatically.
+- Multi-column files are supported: the column holding websites is detected and can be changed, and all other columns are carried over to the export.
+- URLs are normalized to bare domains: scheme, credentials, port, path, query, fragment, `www.` and optionally `m.`/`mobile.` prefixes are removed; internationalized names are converted to punycode.
+- Rows that do not contain a valid domain are reported and skipped, and duplicates are looked up once, so neither costs quota.
 
-## Tech Stack & Architecture
+**Lookup**
 
-- **Language:** Python
-- **UI Runtime:** Streamlit
-- **HTTP Client:** `aiohttp`
-- **Concurrency Runtime:** `asyncio`
-- **Data Handling:** `pandas`
+- Asynchronous requests with a real requests-per-second limit and a cap on parallel connections.
+- Timeouts, network errors, HTTP 5xx and rate limiting are retried with jittered exponential backoff; `Retry-After` is honoured.
+- A rejected key or an exhausted quota stops the batch immediately instead of failing every remaining domain.
+- Results are checkpointed after every response. A stopped or interrupted run resumes where it left off, and failed lookups are retried while resolved domains are never requested twice.
+- A previous export can be loaded back to reuse its results in a new session.
 
-### Project Structure
+**Results**
 
-```text
-.
-├── app.py                # Streamlit entrypoint, UI actions, async traffic workflow
-├── requirements.txt      # Python dependency lock list for runtime
-├── LICENSE               # MIT license
-└── README.md             # Project documentation
-```
+- Summary counters, a traffic distribution breakdown, a minimum-visits threshold, row filters and sorting.
+- `Visits` is a numeric column and `Status` says exactly what happened to each row, so "no traffic data" is never confused with zero or with a failed request.
+- CSV export of the current view, with spreadsheet formulas neutralized.
 
-### Key Design Decisions
-
-- **Async over sync HTTP:** replaces sleep-based serial polling with bounded parallelism.
-- **Fail-soft execution model:** unresolved domains return placeholders instead of halting the run.
-- **Stateful resumability:** checkpointing avoids restarting large batches from scratch.
-- **Explicit response parsing priorities:** avoids non-deterministic recursive key discovery.
-
-<details>
-<summary>Architecture Data Flow (Mermaid)</summary>
+## How It Works
 
 ```mermaid
 flowchart TD
-    A[Upload CSV] --> B[Normalize and deduplicate domains]
-    B --> C[Validate API key with google.com]
-    C -->|valid| D[Spawn async workers with semaphore]
-    C -->|invalid| Z[Show validation error and stop]
-    D --> E[Call DataLoom SimilarWeb endpoint]
-    E --> F{Response status}
-    F -->|success| G[Extract visits via priority keys]
-    F -->|transient error| H[Retry with exponential backoff]
-    H --> E
-    F -->|hard error|max I[Mark domain unresolved]
-    G --> J[Persist result to st.session_state]
+    A[File upload or pasted list] --> B[Normalize, validate and deduplicate domains]
+    B --> C{Result already cached?}
+    C -->|yes| J
+    C -->|no| D[Worker pool behind a rate limiter]
+    D --> E[GET /traffic]
+    E --> F{Response}
+    F -->|200 with visits| G[OK]
+    F -->|200 without visits, 404| H[No data]
+    F -->|timeout, network, 5xx, 429 rate limit| R[Retry with backoff]
+    R --> E
+    R -->|attempts exhausted| I[Failed, retried on the next run]
+    F -->|401, 403, 429 quota| S[Stop the batch]
+    G --> J[Session cache]
+    H --> J
     I --> J
-    J --> K[Apply optional minimum-visits filter]
-    K --> L[Download CSV]
+    J --> K[Filter, sort, export CSV]
 ```
-
-</details>
 
 ## Getting Started
 
 ### Prerequisites
 
-- Python `3.10+`
-- `pip`
-- RapidAPI account with access to DataLoom SimilarWeb endpoint
-- A CSV input file containing one domain/URL per row
+- Python 3.10 or newer
+- A RapidAPI account subscribed to the DataLoom SimilarWeb Insights API
 
 ### Installation
 
 ```bash
-git clone https://github.com/<your-org>/streamlit-similarweb-checker.git
+git clone https://github.com/adops-tool/streamlit-similarweb-checker.git
 cd streamlit-similarweb-checker
-python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-> [!TIP]
-> Keep the virtual environment isolated per project to prevent dependency drift across Streamlit apps.
+To try the app without preparing a list, upload [`examples/domains.csv`](examples/domains.csv).
 
-<details>
-<summary>Troubleshooting and Alternative Setup</summary>
+## Usage
 
-### Common startup issues
+1. Enter your RapidAPI key in the sidebar and, optionally, press **Check key**. The check sends one request for `google.com` and shows the remaining quota.
+2. Upload a file or paste a list of websites. The page reports how many rows, unique domains, duplicates and invalid entries were found.
+3. For files with several columns, confirm the column that holds the websites.
+4. Press **Start lookup**. Progress, the latest result and the estimated time left are shown while the batch runs. **Stop**, like any other interaction with the page, ends the run within a fraction of a second and keeps everything collected so far; only the few requests in flight at that moment are abandoned.
+5. Adjust the threshold and filters, then press **Download CSV**. The file matches the table on screen.
 
-- `ModuleNotFoundError`: confirm the virtual environment is activated before running `pip install`.
-- Streamlit not found: run `python -m pip install -r requirements.txt` to ensure interpreter alignment.
-- API key appears invalid: verify RapidAPI subscription and header quota in your plan dashboard.
+### Export format
 
-### Rebuild from clean environment
+The export contains the input columns followed by two more:
+
+| Column | Content |
+|---|---|
+| `Visits` | Monthly visits, empty when unknown |
+| `Status` | Outcome for the row, see below |
+
+| Status | Meaning | Looked up again on the next run |
+|---|---|---|
+| `OK` | Traffic figure received | No |
+| `No data` | SimilarWeb has no figure for the domain | No |
+| `Invalid domain` | The cell is not a valid domain, no request was made | No |
+| `Not checked` | Not requested yet | Yes |
+| `Timeout`, `Network error`, `HTTP <code>`, `Rate limited`, `Invalid response` | The request failed, retryable errors after all attempts | Yes |
+| `Auth error`, `Quota exhausted` | The API refused the key or the plan ran out of requests; the batch was stopped | Yes |
+
+### Resuming work
+
+Results live in the browser session. Within a session, pressing **Resume lookup** requests only the domains that are still unresolved. To continue in a new session, or on another day, open **Restore previous results** in the sidebar and upload a CSV exported earlier: rows with the status `OK` or `No data` are reused, everything else is looked up again.
+
+### Normalization examples
+
+| Input | Looked up as |
+|---|---|
+| `https://www.example.com/path?a=1#fragment` | `example.com` |
+| `m.news.bbc.co.uk:443/world` | `news.bbc.co.uk` |
+| `subdomain.example.com.` | `subdomain.example.com` |
+| `bücher.de` | `xn--bcher-kva.de` |
+
+Subdomains other than `www` and the mobile prefixes are kept, because SimilarWeb reports them separately.
+
+## Configuration
+
+### Lookup settings
+
+Available in the sidebar under **Lookup settings**; defaults are defined by `ClientSettings` in [`traffic_checker/config.py`](traffic_checker/config.py).
+
+| Setting | Default | Notes |
+|---|---:|---|
+| Requests per second | `3` | Keep within the rate limit of your RapidAPI plan |
+| Parallel requests | `3` | Upper bound on simultaneous connections |
+| Attempts per domain | `3` | Total tries for retryable failures |
+| Request timeout | `15` s | Per attempt |
+| Treat `m.` and `mobile.` hosts as the main domain | on | Turn off to look up mobile hosts separately |
+
+Inputs are limited to 50,000 rows (`MAX_INPUT_ROWS`) and 10 MB per upload (`.streamlit/config.toml`).
+
+### API key
+
+The key can be typed into the sidebar or provisioned on the server, in which case the field may stay empty:
 
 ```bash
-rm -rf venv
-python -m venv venv
-source venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+export RAPIDAPI_KEY="your-key"
 ```
 
-</details>
+or in `.streamlit/secrets.toml`, which is git-ignored:
 
-## Testing
-
-This repository is app-first and does not currently ship a formal unit/integration suite. Use the following validation workflow:
-
-```bash
-python -m py_compile app.py
-streamlit run app.py
+```toml
+RAPIDAPI_KEY = "your-key"
 ```
 
-Recommended local quality gates if you extend the codebase:
+A key typed into the sidebar takes precedence over the provisioned one. The key is kept in memory only; it is not written to disk, logged or included in exports.
+
+> [!CAUTION]
+> With a provisioned key, everyone who can open the app can spend your quota. Put such a deployment behind authentication.
+
+## Project Structure
+
+```text
+.
+├── app.py                    # Streamlit UI
+├── traffic_checker/
+│   ├── config.py             # API endpoint, limits and client defaults
+│   ├── models.py             # LookupResult, LookupStatus, Quota
+│   ├── domains.py            # URL normalization and validation
+│   ├── ingest.py             # File and text parsing, column detection
+│   ├── parsing.py            # Extraction of visits from API payloads
+│   ├── client.py             # HTTP client: rate limiting, retries, quota tracking
+│   ├── batch.py              # Worker pool and early stop on fatal errors
+│   └── report.py             # Result table, filters, CSV export and restore
+├── tests/                    # Unit tests and end-to-end UI tests
+├── examples/domains.csv      # Sample input
+├── .streamlit/config.toml    # Server defaults
+├── Dockerfile
+├── requirements.txt          # Runtime dependencies
+└── requirements-dev.txt      # Runtime dependencies plus pytest and ruff
+```
+
+The `traffic_checker` package does not depend on Streamlit and can be used on its own:
+
+```python
+import asyncio
+
+from traffic_checker.batch import lookup_domains
+
+outcome = asyncio.run(lookup_domains("your-key", ["example.com", "example.org"]))
+for result in outcome.results:
+    print(result.domain, result.status.label, result.visits)
+```
+
+## Development
 
 ```bash
-pytest -q
+pip install -r requirements-dev.txt
+pytest
 ruff check .
+ruff format --check .
 ```
 
-> [!WARNING]
-> `pytest` and `ruff` commands assume you add test files and dev tooling to the repository; they are not guaranteed to run in the current baseline snapshot.
+The tests run against a local stand-in for the API, so they need neither a key nor network access. The same checks run in CI for every push and pull request.
 
 ## Deployment
-
-### Production Guidelines
-
-- Deploy behind authenticated access if API keys are entered by operators.
-- Use environment-level secrets management for platform deployments.
-- Keep outbound concurrency capped to provider-approved limits.
-- Monitor HTTP error rates and throttle backoff behavior during quota pressure.
-
-### Containerization Reference
-
-<details>
-<summary>Example Dockerfile + runtime command</summary>
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-EXPOSE 8501
-CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]
-```
 
 ```bash
 docker build -t dataloom-traffic-checker .
 docker run --rm -p 8501:8501 dataloom-traffic-checker
 ```
 
-</details>
+Add `-e RAPIDAPI_KEY=...` to provision a key. The image runs as an unprivileged user and exposes a health check on `/_stcore/health`.
 
-## Usage
+Things to keep in mind for a shared deployment:
 
-### Basic Usage
-
-1. Launch the app and open the generated local URL.
-2. Paste your RapidAPI key in the sidebar.
-3. Upload a single-column CSV (`domain`, `url`, `website`, and similar headers are auto-detected).
-4. Click **Validate API key**.
-5. Click **Start traffic lookup** and wait for completion.
-6. Download the resulting CSV.
-
-```python
-# Minimal invocation from shell
-# streamlit run app.py
-# Then operate via UI controls.
-```
-
-> [!CAUTION]
-> API keys are held in session memory; do not expose the running app endpoint publicly without access controls.
-
-<details>
-<summary>Advanced Usage, Custom Processing, and Edge Cases</summary>
-
-### Advanced usage patterns
-
-- Re-run interrupted batches without resetting state to process only unresolved domains.
-- Apply a minimum visits threshold to export only commercially meaningful candidates.
-
-### Custom formatters/export post-processing
-
-- Add additional export columns (e.g., confidence score, retry count, normalized host).
-- Route completed CSV into downstream enrichment pipelines.
-
-### Edge cases handled by normalization
-
-- `https://www.example.com/path?a=1#fragment` → `example.com`
-- `m.news.bbc.co.uk:443/world` → `bbc.co.uk`
-- `subdomain.example.com.` → `subdomain.example.com`
-
-</details>
-
-## Configuration
-
-Primary runtime constants are defined in `app.py`:
-
-- `CONCURRENCY_LIMIT`: Max concurrent API requests.
-- `MAX_RETRIES`: Total attempts per domain.
-- `BACKOFF_BASE`: Backoff multiplier for retry delays.
-- `CHECKPOINT_INTERVAL`: Frequency of progress checkpoint signaling.
-- `REQUEST_TIMEOUT`: Per-request timeout (seconds).
-
-<details>
-<summary>Extended Configuration Reference</summary>
-
-| Option | Type | Typical Default | Impact | Tuning Guidance |
-|---|---|---:|---|---|
-| `CONCURRENCY_LIMIT` | `int` | `3` | Throughput vs. rate-limit risk | Increase slowly and monitor 429/5xx rates |
-| `MAX_RETRIES` | `int` | `3` | Recovery from transient failures | Raise for unstable networks; avoid excessive quota burn |
-| `BACKOFF_BASE` | `float` | implementation-defined | Retry pacing | Use exponential progression to avoid burst retries |
-| `CHECKPOINT_INTERVAL` | `int` | implementation-defined | UI/state update cadence | Lower for frequent updates, higher for less overhead |
-| `REQUEST_TIMEOUT` | `int/float` | implementation-defined | Failure detection speed | Balance responsiveness and slow-provider tolerance |
-
-### Environment variables
-
-No mandatory `.env` schema is required in the baseline implementation. For production hardening, common optional variables are:
-
-- `STREAMLIT_SERVER_PORT`
-- `STREAMLIT_SERVER_ADDRESS`
-- platform secret vars for API keys (if you refactor away from manual sidebar entry)
-
-</details>
+- Put the app behind authentication and TLS; Streamlit provides neither on its own.
+- Sessions are independent: each browser session has its own key field and result cache.
+- Keep the request rate within what the RapidAPI plan allows. Overage on some plans is billed.
 
 ## License
 
