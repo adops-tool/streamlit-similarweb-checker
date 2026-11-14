@@ -1,392 +1,589 @@
-"""
-DataLoom Traffic Checker — Streamlit app for bulk SimilarWeb traffic lookup.
+"""Streamlit front end for bulk SimilarWeb traffic lookups via DataLoom on RapidAPI.
 
-Pipeline-friendly improvements over the original version:
-  * Async HTTP with a concurrency limit (3 req/s, matches RapidAPI quota).
-  * Exponential backoff retries on transient failures (network / 5xx / 429).
-  * Checkpointing in st.session_state so a crashed run can be resumed.
-  * Pre-flight API key validation against a known domain before the batch.
-  * Input deduplication after URL normalization (saves quota).
-  * Strict, explicit JSON parsing instead of recursive field guessing.
-  * Optional traffic threshold filter applied directly in the UI.
-  * Robust URL cleaner: strips schema, www, trailing dot, port, path, query.
+The script is a thin presentation layer. Normalization, HTTP, retries and
+reporting live in the ``traffic_checker`` package and know nothing about
+Streamlit.
 """
+
+from __future__ import annotations
 
 import asyncio
-import io
-import re
+import logging
+import os
+import threading
 import time
-from typing import Optional
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal
 
-import aiohttp
 import pandas as pd
 import streamlit as st
 
-# --- Configuration constants ---
-API_HOST = "similarweb-insights.p.rapidapi.com"
-API_URL = f"https://{API_HOST}/traffic"
-VALIDATION_DOMAIN = "google.com"  # Known-good domain for key validation
-CONCURRENCY_LIMIT = 3              # RapidAPI DataLoom plan ceiling
-REQUEST_TIMEOUT = 15               # Seconds per request
-MAX_RETRIES = 3                    # Total attempts per domain on transient errors
-BACKOFF_BASE = 1.5                 # Exponential backoff base delay (seconds)
-CHECKPOINT_INTERVAL = 25           # Persist results every N completed domains
-
-
-# --- URL normalization ---
-def clean_url(url: str) -> str:
-    """Normalize a raw user-supplied URL into a bare domain.
-
-    Handles: schema (http/https/ftp), www and www2/www3, trailing dot,
-    port, path, query, fragment, mobile subdomain prefix, surrounding
-    whitespace, and case folding. Returns empty string for NaN/empty input.
-    """
-    if pd.isna(url) or not str(url).strip():
-        return ""
-    url = str(url).strip().lower()
-    url = re.sub(r"^[a-z0-9+\-.]+://", "", url)   # Strip schema
-    url = re.sub(r"^www\d*\.", "", url)            # Strip www / www2 / www3
-    url = url.split("/")[0]                         # Drop path
-    url = url.split("?")[0]                         # Drop query
-    url = url.split("#")[0]                         # Drop fragment
-    url = url.split(":")[0]                         # Drop port
-    url = url.rstrip(".")                           # Strip trailing dot
-    # Normalize mobile subdomain — m.cnn.com and cnn.com are reported separately
-    # by SimilarWeb, but for outreach lists we usually want the canonical apex.
-    url = re.sub(r"^(m|mobile)\.", "", url)
-    return url.strip()
-
-
-# --- API response parsing ---
-def extract_visits(payload: dict) -> Optional[float]:
-    """Extract monthly visits from a DataLoom traffic response.
-
-    Tries the documented top-level fields in priority order rather than
-    searching recursively, which avoids ambiguity when multiple keys exist
-    at different nesting levels.
-    """
-    if not isinstance(payload, dict):
-        return None
-
-    # Documented fields, ordered by preference.
-    direct_keys = ("visits", "monthly_visits", "total_visits", "traffic")
-    for key in direct_keys:
-        if key in payload and isinstance(payload[key], (int, float)):
-            return float(payload[key])
-
-    # Some DataLoom responses nest the metric under "engagements" or "data".
-    for container_key in ("engagements", "data", "result"):
-        nested = payload.get(container_key)
-        if isinstance(nested, dict):
-            for key in direct_keys:
-                if key in nested and isinstance(nested[key], (int, float)):
-                    return float(nested[key])
-
-    return None
-
-
-# --- Async API caller ---
-async def fetch_traffic(
-    session: aiohttp.ClientSession,
-    domain: str,
-    api_key: str,
-    semaphore: asyncio.Semaphore,
-) -> tuple[str, str, str]:
-    """Fetch traffic for a single domain with retries.
-
-    Returns a tuple: (domain, visits_as_string, requests_remaining_header).
-    visits_as_string uses a sentinel value on hard failures so the caller
-    can distinguish "0 traffic" from "lookup failed".
-    """
-    headers = {
-        "x-rapidapi-host": API_HOST,
-        "x-rapidapi-key": api_key,
-        "Content-Type": "application/json",
-    }
-    params = {"domain": domain}
-
-    if not domain:
-        return domain, "Invalid", "Unknown"
-
-    async with semaphore:
-        last_error = "Unknown error"
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                async with session.get(
-                    API_URL,
-                    headers=headers,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                ) as response:
-                    remaining = response.headers.get(
-                        "x-ratelimit-requests-remaining", "Unknown"
-                    )
-
-                    if response.status == 200:
-                        data = await response.json()
-                        visits = extract_visits(data)
-                        return domain, str(int(visits)) if visits is not None else "0", remaining
-
-                    if response.status == 429:
-                        # Quota exhausted — no point retrying further.
-                        return domain, "Quota exhausted", "0"
-
-                    if response.status in (401, 403):
-                        return domain, "Auth error", remaining
-
-                    # 5xx and other transient codes fall through to retry.
-                    last_error = f"HTTP {response.status}"
-
-            except asyncio.TimeoutError:
-                last_error = "Timeout"
-            except aiohttp.ClientError as exc:
-                last_error = f"Network: {type(exc).__name__}"
-
-            # Exponential backoff before next attempt.
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(BACKOFF_BASE ** attempt)
-
-        return domain, last_error, "Unknown"
-
-
-# --- Pre-flight key validation ---
-async def validate_api_key(api_key: str) -> tuple[bool, str]:
-    """Make one test request to verify the API key works.
-
-    Returns (is_valid, message). The message is shown to the user so they
-    can distinguish bad key from network problems before launching a batch.
-    """
-    headers = {
-        "x-rapidapi-host": API_HOST,
-        "x-rapidapi-key": api_key,
-        "Content-Type": "application/json",
-    }
-    params = {"domain": VALIDATION_DOMAIN}
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                API_URL,
-                headers=headers,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ) as response:
-                remaining = response.headers.get(
-                    "x-ratelimit-requests-remaining", "Unknown"
-                )
-                if response.status == 200:
-                    return True, f"Key is valid. Requests remaining: {remaining}"
-                if response.status in (401, 403):
-                    return False, "API key rejected (401/403). Check the key value."
-                if response.status == 429:
-                    return False, "Quota exhausted before the run started."
-                return False, f"Unexpected status {response.status} during validation."
-    except Exception as exc:
-        return False, f"Network error during validation: {exc}"
-
-
-# --- Batch runner ---
-async def run_batch(
-    domains: list[str],
-    api_key: str,
-    progress_callback,
-) -> list[tuple[str, str, str]]:
-    """Run the full batch of domain lookups concurrently with checkpointing.
-
-    progress_callback(idx, total, domain, visits, remaining) is called
-    after every completed lookup so the UI can update progress and persist
-    intermediate state.
-    """
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    results: list[tuple[str, str, str]] = []
-
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            fetch_traffic(session, domain, api_key, semaphore)
-            for domain in domains
-        ]
-        for idx, future in enumerate(asyncio.as_completed(tasks), start=1):
-            domain, visits, remaining = await future
-            results.append((domain, visits, remaining))
-            progress_callback(idx, len(domains), domain, visits, remaining)
-
-    return results
-
-
-# --- Streamlit UI ---
-st.set_page_config(page_title="DataLoom Traffic Checker", layout="wide")
-st.title("DataLoom Traffic Checker")
-st.caption(
-    "Bulk SimilarWeb traffic lookup via the DataLoom RapidAPI provider. "
-    "Async, retry-aware, with checkpointing and threshold filtering."
+from traffic_checker.batch import lookup_domains, run_with_heartbeat
+from traffic_checker.client import InvalidApiKeyError, check_api_key, clean_api_key
+from traffic_checker.config import API_KEY_ENV_VAR, MAX_INPUT_ROWS, ClientSettings
+from traffic_checker.ingest import (
+    InputError,
+    PreparedInput,
+    guess_domain_column,
+    prepare_input,
+    read_table,
+    table_from_text,
+)
+from traffic_checker.models import LookupResult, LookupStatus, Quota
+from traffic_checker.report import (
+    VISITS_COLUMN,
+    build_report,
+    refine_report,
+    restore_results,
+    summarize,
+    to_csv_bytes,
+    traffic_tiers,
 )
 
-# Sidebar — credentials and run options.
-st.sidebar.header("Access settings")
-api_key = st.sidebar.text_input(
-    "x-rapidapi-key", type="password", help="Stored in session memory only."
-)
-st.sidebar.caption(
-    "The key lives in browser session memory. Do not share the running URL."
-)
+logger = logging.getLogger(__name__)
 
-st.sidebar.header("Run options")
-threshold = st.sidebar.number_input(
-    "Minimum visits filter (applied to download)",
-    min_value=0,
-    value=0,
-    step=1000,
-    help="Rows below this value are excluded from the downloaded CSV. Set 0 to keep all.",
-)
+# Session-state keys.
+RESULTS_KEY = "results"  # dict[str, LookupResult] keyed by normalized domain
+QUOTA_KEY = "quota"  # last Quota reported by the API
+FLASH_KEY = "flash"  # (level, message) shown once after the next rerun
+RUN_LOCK_KEY = "run_lock"  # threading.Lock held for the duration of a batch
 
-# Initialize session state for checkpoint persistence.
-if "results" not in st.session_state:
-    st.session_state["results"] = {}  # Keyed by clean_domain → visits
-if "input_df" not in st.session_state:
-    st.session_state["input_df"] = None
+# How often a running batch yields to Streamlit; bounds the reaction time to Stop.
+HEARTBEAT_SECONDS = 0.25
 
-uploaded_file = st.file_uploader(
-    "Upload your CSV with the list of websites", type=["csv"]
-)
+SOURCE_UPLOAD = "Upload a file"
+SOURCE_PASTE = "Paste a list"
 
-if uploaded_file:
-    if not api_key:
-        st.warning("Please enter your API key in the sidebar.")
-        st.stop()
+FlashLevel = Literal["success", "info", "warning", "error"]
+FLASH_RENDERERS = {
+    "success": st.success,
+    "info": st.info,
+    "warning": st.warning,
+    "error": st.error,
+}
 
-    with st.spinner("Reading file..."):
-        # Read without a header — the first row is often a real domain.
-        user_df = pd.read_csv(uploaded_file, header=None)
-        if user_df.empty:
-            st.error("The file is empty.")
-            st.stop()
+ROW_FILTER_LABELS = {
+    "all": "All rows",
+    "resolved": "With traffic data",
+    "unresolved": "Without traffic data",
+}
 
-        # Drop a header row only if it is clearly a label, not a domain.
-        first_val = str(user_df.iloc[0, 0]).lower().strip()
-        header_labels = {"url", "domain", "website", "сайт", "домен", "ссылка"}
-        if first_val in header_labels:
-            user_df = user_df.iloc[1:].reset_index(drop=True)
+INVALID_PREVIEW_ROWS = 200
 
-        site_column = user_df.columns[0]
-        user_df.rename(columns={site_column: "Domain"}, inplace=True)
-        user_df["Clean_Domain"] = user_df["Domain"].apply(clean_url)
 
-        # Deduplicate after normalization to avoid burning quota on repeats,
-        # but keep the original ordering and the original Domain column for
-        # the user-facing output.
-        unique_domains = (
-            user_df.loc[user_df["Clean_Domain"] != "", "Clean_Domain"]
-            .drop_duplicates()
-            .tolist()
-        )
+@dataclass(frozen=True)
+class Options:
+    """Everything the sidebar contributes to a run."""
 
-        st.session_state["input_df"] = user_df
+    api_key: str  # Empty when no usable key is available.
+    settings: ClientSettings
+    strip_mobile_prefix: bool
 
-    st.write(
-        f"Loaded **{len(user_df)}** rows, "
-        f"**{len(unique_domains)}** unique domains after normalization."
+
+# --- Cached data preparation -------------------------------------------------
+# Streamlit re-executes this script on every interaction; caching keeps parsing
+# and normalization of large inputs off that hot path. Both functions are keyed
+# by the raw input rather than by a DataFrame: Streamlit hashes large frames by
+# sampling rows, which could serve a stale result for two big inputs that
+# differ in only a few lines.
+
+
+@st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
+def _load_table(payload: bytes | str) -> pd.DataFrame:
+    """Parse an uploaded file (bytes) or a pasted list (str)."""
+    if isinstance(payload, bytes):
+        return read_table(payload)
+    return table_from_text(payload)
+
+
+@st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
+def _prepare(payload: bytes | str, domain_column: str, strip_mobile_prefix: bool) -> PreparedInput:
+    return prepare_input(
+        _load_table(payload),
+        domain_column,
+        strip_mobile_prefix=strip_mobile_prefix,
     )
 
-    col1, col2, col3 = st.columns(3)
-    validate_btn = col1.button("Validate API key", type="secondary")
-    start_btn = col2.button("Start traffic lookup", type="primary")
-    reset_btn = col3.button("Reset checkpoint")
 
-    if reset_btn:
-        st.session_state["results"] = {}
-        st.success("Checkpoint cleared. The next run will start from scratch.")
+# --- Session helpers ---------------------------------------------------------
 
-    if validate_btn:
-        with st.spinner("Validating key against google.com..."):
-            ok, msg = asyncio.run(validate_api_key(api_key))
-        if ok:
-            st.success(msg)
+
+def _init_state() -> None:
+    st.session_state.setdefault(RESULTS_KEY, {})
+    st.session_state.setdefault(QUOTA_KEY, Quota())
+    st.session_state.setdefault(RUN_LOCK_KEY, threading.Lock())
+
+
+def _wait_for_previous_run() -> None:
+    """Block until a batch started by a superseded script run has wound down.
+
+    On every interaction Streamlit starts the new script run right away, in a
+    new thread, while the previous one keeps going until its next ``st.*``
+    call. Waiting here guarantees that this run renders the final state of
+    that batch and never sends requests alongside it.
+    """
+    with st.session_state[RUN_LOCK_KEY]:
+        pass
+
+
+def _flash(level: FlashLevel, message: str) -> None:
+    """Queue a message for the top of the page on the next script run."""
+    st.session_state[FLASH_KEY] = (level, message)
+
+
+def _show_flash() -> None:
+    flash = st.session_state.pop(FLASH_KEY, None)
+    if flash is not None:
+        level, message = flash
+        FLASH_RENDERERS[level](message)
+
+
+def _clear_results() -> None:
+    st.session_state[RESULTS_KEY] = {}
+    _flash("info", "Cached results cleared. The next run starts from scratch.")
+
+
+def _provisioned_api_key() -> str:
+    """Return a key supplied by the operator through the environment or secrets."""
+    key = os.environ.get(API_KEY_ENV_VAR, "")
+    if key:
+        return key
+    try:
+        return str(st.secrets.get(API_KEY_ENV_VAR, ""))
+    except FileNotFoundError:
+        # No secrets file is configured for this deployment.
+        return ""
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {seconds:02d} s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d} min"
+
+
+# --- Sidebar -----------------------------------------------------------------
+
+
+def render_sidebar() -> Options:
+    with st.sidebar:
+        api_key = _render_access()
+        settings, strip_mobile_prefix = _render_settings()
+        _render_session(strip_mobile_prefix)
+    return Options(api_key=api_key, settings=settings, strip_mobile_prefix=strip_mobile_prefix)
+
+
+def _render_access() -> str:
+    st.header("API access")
+    provisioned = _provisioned_api_key()
+    entered = st.text_input(
+        "RapidAPI key",
+        type="password",
+        placeholder="Leave empty to use the server key" if provisioned else "x-rapidapi-key",
+        help=(
+            "Held in server memory for this browser session only. "
+            "It is never written to disk or to logs."
+        ),
+    )
+
+    api_key = ""
+    candidate = entered or provisioned
+    if candidate:
+        try:
+            api_key = clean_api_key(candidate)
+        except InvalidApiKeyError as exc:
+            st.error(str(exc))
+    if api_key and not entered:
+        st.caption("Using the key configured on the server.")
+
+    if st.button(
+        "Check key",
+        disabled=not api_key,
+        help="Sends one request for google.com. It counts against the quota.",
+    ):
+        with st.spinner("Checking the key..."):
+            check = asyncio.run(check_api_key(api_key))
+        st.session_state[QUOTA_KEY] = check.quota
+        if check.ok:
+            st.success(check.message)
         else:
-            st.error(msg)
+            st.error(check.message)
 
-    if start_btn:
-        # Resume support: skip domains we already have results for.
-        already_done = set(st.session_state["results"].keys())
-        pending = [d for d in unique_domains if d not in already_done]
+    quota: Quota = st.session_state[QUOTA_KEY]
+    if quota.remaining is not None:
+        of_limit = f" of {quota.limit:,}" if quota.limit is not None else ""
+        st.caption(f"Quota: **{quota.remaining:,}**{of_limit} requests left.")
+    return api_key
 
-        if not pending:
-            st.info("All domains are already in the checkpoint. Nothing to do.")
+
+def _render_settings() -> tuple[ClientSettings, bool]:
+    defaults = ClientSettings()
+    with st.expander("Lookup settings"):
+        requests_per_second = st.slider(
+            "Requests per second",
+            min_value=1,
+            max_value=20,
+            value=int(defaults.requests_per_second),
+            help="Keep this within the rate limit of your RapidAPI plan.",
+        )
+        max_concurrency = st.slider(
+            "Parallel requests",
+            min_value=1,
+            max_value=10,
+            value=defaults.max_concurrency,
+        )
+        max_attempts = st.slider(
+            "Attempts per domain",
+            min_value=1,
+            max_value=5,
+            value=defaults.max_attempts,
+            help="Timeouts, network errors, HTTP 5xx and rate limiting are retried.",
+        )
+        request_timeout = st.slider(
+            "Request timeout, seconds",
+            min_value=5,
+            max_value=60,
+            value=int(defaults.request_timeout),
+        )
+        strip_mobile_prefix = st.checkbox(
+            "Treat m. and mobile. hosts as the main domain",
+            value=True,
+            help="m.example.com is looked up, and deduplicated, as example.com.",
+        )
+
+    settings = ClientSettings(
+        requests_per_second=float(requests_per_second),
+        max_concurrency=max_concurrency,
+        request_timeout=float(request_timeout),
+        max_attempts=max_attempts,
+    )
+    return settings, strip_mobile_prefix
+
+
+def _render_session(strip_mobile_prefix: bool) -> None:
+    results: dict[str, LookupResult] = st.session_state[RESULTS_KEY]
+
+    st.header("Session")
+    with st.expander("Restore previous results"):
+        st.caption(
+            "Upload a CSV exported by this app to reuse its results instead of "
+            "spending quota on the same domains again."
+        )
+        export = st.file_uploader("Results CSV", type=["csv"], label_visibility="collapsed")
+        if st.button("Restore", disabled=export is None) and export is not None:
+            try:
+                restored = restore_results(
+                    read_table(export.getvalue()),
+                    strip_mobile_prefix=strip_mobile_prefix,
+                )
+            except InputError as exc:
+                st.error(str(exc))
+            else:
+                # Definitive results obtained in this session are at least as
+                # fresh as the file, so they take precedence.
+                fresh = {
+                    domain: result
+                    for domain, result in restored.items()
+                    if domain not in results or not results[domain].status.is_final
+                }
+                results.update(fresh)
+                st.success(f"Restored {len(fresh):,} results.")
+
+    st.caption(f"{len(results):,} domains cached in this session.")
+    st.button("Clear cached results", on_click=_clear_results, disabled=not results)
+
+
+# --- Input -------------------------------------------------------------------
+
+
+def render_input(strip_mobile_prefix: bool) -> PreparedInput | None:
+    """Render the input widgets and return the prepared table, if there is one."""
+    source = st.radio(
+        "Input source",
+        (SOURCE_UPLOAD, SOURCE_PASTE),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    try:
+        if source == SOURCE_UPLOAD:
+            uploaded = st.file_uploader(
+                "CSV, TSV or TXT file with one website per row",
+                type=["csv", "tsv", "txt"],
+                help=(
+                    f"Up to {MAX_INPUT_ROWS:,} rows. Extra columns are kept and "
+                    "carried over to the export."
+                ),
+            )
+            if uploaded is None:
+                return None
+            payload: bytes | str = uploaded.getvalue()
         else:
-            st.info(
-                f"Looking up {len(pending)} domains "
-                f"({len(already_done)} already cached from previous run)."
+            payload = st.text_area(
+                "Domains or URLs, one per line",
+                height=180,
+                placeholder="example.com\nhttps://www.example.org/pricing",
+            )
+            if not payload.strip():
+                return None
+        table = _load_table(payload)
+    except InputError as exc:
+        st.error(str(exc))
+        return None
+
+    columns = list(table.columns)
+    domain_column = columns[0]
+    if len(columns) > 1:
+        domain_column = st.selectbox(
+            "Column with websites",
+            columns,
+            index=columns.index(guess_domain_column(table)),
+        )
+
+    prepared = _prepare(payload, domain_column, strip_mobile_prefix)
+    if not prepared.unique_domains:
+        st.error(f"No valid domains were found in the '{domain_column}' column.")
+        return None
+
+    _render_input_summary(prepared)
+    return prepared
+
+
+def _render_input_summary(prepared: PreparedInput) -> None:
+    rows, unique, duplicates, invalid = st.columns(4)
+    rows.metric("Rows", f"{prepared.row_count:,}")
+    unique.metric("Unique domains", f"{len(prepared.unique_domains):,}")
+    duplicates.metric(
+        "Duplicates",
+        f"{prepared.duplicate_count:,}",
+        help="Rows repeating an already listed domain. They are looked up once.",
+    )
+    invalid.metric(
+        "Invalid",
+        f"{prepared.invalid_count:,}",
+        help="Rows without a valid domain. They are skipped and cost no quota.",
+    )
+
+    if prepared.invalid_count:
+        with st.expander(f"Rows without a valid domain ({prepared.invalid_count:,})"):
+            invalid_rows = prepared.table.loc[prepared.normalized.isna(), [prepared.domain_column]]
+            st.dataframe(invalid_rows.head(INVALID_PREVIEW_ROWS), hide_index=True)
+            if prepared.invalid_count > INVALID_PREVIEW_ROWS:
+                st.caption(f"Showing the first {INVALID_PREVIEW_ROWS}.")
+
+
+# --- Lookup ------------------------------------------------------------------
+
+
+def render_run(prepared: PreparedInput, options: Options) -> None:
+    results: dict[str, LookupResult] = st.session_state[RESULTS_KEY]
+    # Only definitive answers count as done; failed lookups are retried.
+    pending = [
+        domain
+        for domain in prepared.unique_domains
+        if domain not in results or not results[domain].status.is_final
+    ]
+    done = len(prepared.unique_domains) - len(pending)
+
+    if not pending:
+        st.success(f"All {done:,} domains are resolved.")
+        return
+
+    estimate = _format_duration(len(pending) / options.settings.requests_per_second)
+    already = f" ({done:,} already resolved)" if done else ""
+    st.write(
+        f"**{len(pending):,}** domains to look up{already}. Each lookup uses one "
+        f"API request; the run takes at least {estimate}."
+    )
+
+    quota: Quota = st.session_state[QUOTA_KEY]
+    if quota.remaining is not None and quota.remaining < len(pending):
+        st.warning(
+            f"Only {quota.remaining:,} requests are left on the plan. Depending on "
+            "the plan, the run either stops at that point or incurs overage charges."
+        )
+    if not options.api_key:
+        st.info("Enter your RapidAPI key in the sidebar to start.")
+
+    resuming = any(domain in results for domain in prepared.unique_domains)
+    label = "Resume lookup" if resuming else "Start lookup"
+    if st.button(label, type="primary", disabled=not options.api_key):
+        _run_lookup(pending, options)
+
+
+def _run_lookup(domains: list[str], options: Options) -> None:
+    results: dict[str, LookupResult] = st.session_state[RESULTS_KEY]
+    total = len(domains)
+    completed = 0
+    latest: LookupResult | None = None
+    started_at = time.monotonic()
+
+    progress = st.progress(0.0, text="Starting...")
+    # Any widget interaction makes Streamlit stop the running script, so the
+    # button needs no handler beyond leaving a note for the next run.
+    st.button(
+        "Stop",
+        on_click=_flash,
+        args=("info", "Lookup stopped. Collected results are kept; resume at any time."),
+    )
+
+    def on_result(result: LookupResult) -> None:
+        nonlocal completed, latest
+        # Checkpoint straight into the session so that a stop loses nothing.
+        results[result.domain] = result
+        completed += 1
+        latest = result
+
+    # Doubles as the heartbeat of the batch: Streamlit can stop a script only
+    # from inside an st.* call, and a batch waiting on the network makes none.
+    def render_progress() -> None:
+        if latest is None:
+            progress.progress(0.0, text="Starting...")
+            return
+        elapsed = time.monotonic() - started_at
+        remaining = _format_duration(elapsed / completed * (total - completed))
+        value = f"{latest.visits:,}" if latest.visits is not None else latest.label
+        progress.progress(
+            completed / total,
+            text=f"{completed:,} / {total:,} | {latest.domain}: {value} | about {remaining} left",
+        )
+
+    try:
+        with st.session_state[RUN_LOCK_KEY]:
+            batch = lookup_domains(options.api_key, domains, options.settings, on_result)
+            outcome = asyncio.run(run_with_heartbeat(batch, render_progress, HEARTBEAT_SECONDS))
+    except Exception:
+        logger.exception("Lookup batch aborted by an unexpected error")
+        _flash(
+            "error",
+            "The run was interrupted by an unexpected error. Collected results "
+            "are kept; start the lookup again to resume.",
+        )
+    else:
+        st.session_state[QUOTA_KEY] = outcome.quota
+        elapsed = time.monotonic() - started_at
+        _flash(*_describe_outcome(outcome.results, outcome.halted_by, elapsed))
+    # Rerun so that counters and buttons rendered before the run catch up.
+    st.rerun()
+
+
+def _describe_outcome(
+    results: list[LookupResult],
+    halted_by: LookupStatus | None,
+    elapsed: float,
+) -> tuple[FlashLevel, str]:
+    resolved = sum(result.status.is_final for result in results)
+    if halted_by is LookupStatus.AUTH_ERROR:
+        return "error", "The API rejected the key, so the run was stopped. Check the key and retry."
+    if halted_by is LookupStatus.QUOTA_EXHAUSTED:
+        return (
+            "warning",
+            f"The request quota ran out after {resolved:,} resolved domains; the rest "
+            "stay pending. Download the CSV to keep these results and restore it "
+            "once the quota resets.",
+        )
+
+    failed = len(results) - resolved
+    message = f"Looked up {len(results):,} domains in {_format_duration(elapsed)}."
+    if failed:
+        return "warning", f"{message} {failed:,} failed and will be retried on the next run."
+    return "success", message
+
+
+# --- Results -----------------------------------------------------------------
+
+
+def render_results(prepared: PreparedInput) -> None:
+    results: dict[str, LookupResult] = st.session_state[RESULTS_KEY]
+    summary = summarize(prepared, results)
+    if summary.pending == len(prepared.unique_domains):
+        return
+
+    st.subheader("Results")
+    resolved, no_data, failed, pending = st.columns(4)
+    resolved.metric("Resolved", f"{summary.resolved:,}")
+    no_data.metric(
+        "No data",
+        f"{summary.no_data:,}",
+        help="SimilarWeb has no traffic figure for these domains.",
+    )
+    failed.metric(
+        "Failed",
+        f"{summary.failed:,}",
+        help="Lookups that ended in an error. They are retried on the next run.",
+    )
+    pending.metric("Not checked", f"{summary.pending:,}")
+
+    report = build_report(prepared, results)
+
+    threshold_column, rows_column, sort_column = st.columns(3, vertical_alignment="bottom")
+    min_visits = threshold_column.number_input(
+        "Minimum monthly visits",
+        min_value=0,
+        value=0,
+        step=1000,
+        help="Rows below the threshold, or without a traffic figure, are hidden.",
+    )
+    rows = rows_column.selectbox(
+        "Rows",
+        list(ROW_FILTER_LABELS),
+        format_func=ROW_FILTER_LABELS.__getitem__,
+    )
+    sort_by_visits = sort_column.checkbox("Sort by visits, highest first")
+
+    view = refine_report(report, min_visits=min_visits, rows=rows, sort_by_visits=sort_by_visits)
+    st.caption(f"Showing {len(view):,} of {len(report):,} rows. The download matches this view.")
+    st.dataframe(
+        view,
+        hide_index=True,
+        column_config={VISITS_COLUMN: st.column_config.NumberColumn(format="localized")},
+    )
+    st.download_button(
+        "Download CSV",
+        data=to_csv_bytes(view),
+        file_name=f"traffic-{datetime.now():%Y%m%d-%H%M%S}.csv",
+        mime="text/csv",
+        disabled=view.empty,
+    )
+
+    if summary.resolved:
+        with st.expander("Traffic distribution"):
+            visits = [
+                results[domain].visits
+                for domain in prepared.unique_domains
+                if domain in results and results[domain].visits is not None
+            ]
+            st.dataframe(
+                traffic_tiers(visits),
+                hide_index=True,
+                column_config={
+                    "Share": st.column_config.ProgressColumn(
+                        format="percent", min_value=0.0, max_value=1.0
+                    )
+                },
             )
 
-            progress_bar = st.progress(0.0, text="Starting...")
-            status_box = st.empty()
-            start_time = time.time()
 
-            def on_progress(idx: int, total: int, domain: str, visits: str, remaining: str):
-                # Persist immediately so a tab reload doesn't lose work.
-                st.session_state["results"][domain] = visits
-                fraction = min(idx / total, 1.0)
-                elapsed = time.time() - start_time
-                eta = (elapsed / idx) * (total - idx) if idx else 0
-                progress_bar.progress(
-                    fraction,
-                    text=(
-                        f"[{idx}/{total}] {domain} → {visits} | "
-                        f"quota left: {remaining} | ETA: {eta:0.0f}s"
-                    ),
-                )
-                # Periodic checkpoint announcement (state already persisted above).
-                if idx % CHECKPOINT_INTERVAL == 0:
-                    status_box.caption(
-                        f"Checkpoint saved at {idx}/{total}."
-                    )
+def main() -> None:
+    st.set_page_config(page_title="DataLoom Traffic Checker", layout="wide")
+    _init_state()
+    _wait_for_previous_run()
+    options = render_sidebar()
 
-            try:
-                asyncio.run(run_batch(pending, api_key, on_progress))
-                progress_bar.empty()
-                status_box.empty()
-                st.success(
-                    f"Done in {time.time() - start_time:0.1f}s. "
-                    f"Total cached results: {len(st.session_state['results'])}."
-                )
-            except Exception as exc:
-                st.error(
-                    f"Run interrupted: {exc}. "
-                    f"Partial results are saved in the checkpoint — "
-                    f"click Start again to resume."
-                )
+    st.title("DataLoom Traffic Checker")
+    st.caption("Bulk SimilarWeb traffic lookup through the DataLoom API on RapidAPI.")
+    _show_flash()
 
-    # Render whatever is currently in the checkpoint, even between runs.
-    if st.session_state["results"]:
-        df = st.session_state["input_df"].copy()
-        df["Visits"] = df["Clean_Domain"].map(
-            lambda d: st.session_state["results"].get(d, "-")
-        )
+    prepared = render_input(options.strip_mobile_prefix)
+    if prepared is None:
+        return
+    render_run(prepared, options)
+    render_results(prepared)
 
-        # Numeric column for filtering / sorting; non-numeric statuses become NaN.
-        df["Visits_Numeric"] = pd.to_numeric(df["Visits"], errors="coerce")
 
-        if threshold > 0:
-            filtered = df[df["Visits_Numeric"] >= threshold].copy()
-        else:
-            filtered = df.copy()
-
-        st.write(
-            f"Result: {len(filtered)} rows after threshold filter "
-            f"(threshold = {threshold})."
-        )
-        st.dataframe(
-            filtered.drop(columns=["Clean_Domain", "Visits_Numeric"]).head(25)
-        )
-
-        # Final CSV: drop helper columns, keep original Domain + Visits.
-        export_df = filtered.drop(columns=["Clean_Domain", "Visits_Numeric"])
-        csv_buffer = io.BytesIO()
-        export_df.to_csv(csv_buffer, index=False, encoding="utf-8")
-
-        st.download_button(
-            label="Download result (CSV)",
-            data=csv_buffer.getvalue(),
-            file_name="dataloom_traffic_full.csv",
-            mime="text/csv",
-        )
+main()
