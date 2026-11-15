@@ -26,6 +26,24 @@ The workflow here is as straightforward as possible:
 4. Push the changes to your fork (`git push origin feature/my-awesome-idea`).
 5. Open a Pull Request to this repository.
 
+## ⬢ Local Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+```
+
+Before opening a Pull Request, please make sure the same checks that run in CI pass locally:
+
+```bash
+pytest
+ruff check .
+ruff format --check .
+```
+
+The tests use a local stand-in for the API, so no RapidAPI key is needed.
+
 ## ⬢ A Few Simple Requests
 
 - Try to stick to the code style already used in the project.

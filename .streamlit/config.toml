@@ -1,0 +1,12 @@
+[server]
+# Upload cap in MB. Domain lists are small, and a tight limit bounds the
+# memory a single upload can claim.
+maxUploadSize = 10
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# End users see the exception type only; tracebacks stay in the server log.
+showErrorDetails = "type"
+toolbarMode = "minimal"
